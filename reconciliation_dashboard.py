@@ -520,7 +520,7 @@ def render_discrepancy_detail(discrepancy):
     )
     
     if not invoices.empty:
-        display_cols = ['invoice_number', 'contact_name', 'service_provided', 
+        display_cols = ['invoice_number','clinic', 'contact_name', 'service_provided', 
                        'total_amount', 'payment_taken', 'payment_method', 'source']
         display_cols = [c for c in display_cols if c in invoices.columns]
         st.dataframe(invoices[display_cols], use_container_width=True, height=150)
