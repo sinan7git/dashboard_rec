@@ -189,6 +189,217 @@ def load_clinician_mappings():
     except:
         return pd.DataFrame()
 
+
+def lookup_practitioner_info(terminal_sn, date_obj):
+    """
+    Finds the practitioner assigned to a terminal (using terminal_assignments)
+    and their scheduled site (using practitioner_schedule) for context.
+    """
+    # 1. Get Name from Terminal Assignment
+    # We look for the assignment that was active on or matches the terminal SN
+    query_assign = """
+    SELECT practitioner_name 
+    FROM terminal_assignments 
+    WHERE terminal_sn = :terminal
+    LIMIT 1
+    """
+    # Note: We cast terminal to string to ensure matching works against varchar column
+    df_assign = fetch_dataframe(query_assign, {'terminal': str(terminal_sn)})
+    
+    if df_assign.empty:
+        return None, None
+        
+    practitioner_name = df_assign.iloc[0]['practitioner_name']
+    
+    # 2. Get Site from Schedule (For context/verification)
+    query_schedule = """
+    SELECT site 
+    FROM practitioner_schedule
+    WHERE practitioner = :name 
+      AND schedule_date = :date
+    LIMIT 1
+    """
+    df_schedule = fetch_dataframe(query_schedule, {'name': practitioner_name, 'date': date_obj})
+    
+    site_name = "Unknown Site"
+    if not df_schedule.empty:
+        site_name = df_schedule.iloc[0]['site']
+        
+    return practitioner_name, site_name
+
+def load_system_invoices(practitioner_name, date_obj):
+    """
+    Fetch raw invoice rows from the database for comparison.
+    Matches practitioner name loosely (first name or full name) to catch all variations.
+    """
+    query = """
+    SELECT 
+        invoice_number AS "Invoice #",
+        TO_CHAR(created_at, 'HH24:MI') AS "Time Logged",
+        contact_name AS "Patient",
+        service_provided AS "Service",
+        payment_method AS "Method",
+        payment_taken AS "Paid £",
+        clinic AS "Clinic",
+        is_deposit AS "Deposit?"
+    FROM clearearwax_finance_invoice_data
+    WHERE invoice_date = :date
+      AND (
+        LOWER(practitioner) = LOWER(:name)
+        OR LOWER(SPLIT_PART(practitioner, ' ', 1)) = LOWER(SPLIT_PART(:name, ' ', 1))
+        OR LOWER(clinician_name) = LOWER(:name)
+      )
+    ORDER BY created_at ASC
+    """
+    return fetch_dataframe(query, {'date': date_obj, 'name': practitioner_name})
+
+def render_manual_audit():
+    st.title("🕵️ Manual Audit Tool")
+    st.markdown("""
+    **Compare the 'Bank' vs the 'System'.**
+    Upload a transaction CSV to see exactly what money arrived and match it against the invoices logged in the system.
+    """)
+
+    # --- STEP 1: UPLOAD BANK FILE ---
+    st.subheader("1. Upload Bank Data")
+    uploaded_file = st.file_uploader("📂 Upload Transaction CSV/Excel", type=["csv", "xlsx"])
+
+    if not uploaded_file:
+        st.info("👆 Please upload a file to begin the audit.")
+        return
+
+    # Load Data
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded_file, dtype=str)
+        else:
+            df = pd.read_excel(uploaded_file, dtype=str)
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        return
+
+    # --- STEP 2: MAP COLUMNS ---
+    with st.expander("⚙️ Column Mapping (Click to Edit)", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        cols = df.columns.tolist()
+        
+        # Smart defaults
+        date_idx = next((i for i, c in enumerate(cols) if 'TIME' in c.upper() or 'DATE' in c.upper()), 0)
+        term_idx = next((i for i, c in enumerate(cols) if 'TERMINAL' in c.upper() or 'SN' in c.upper()), 0)
+        amt_idx = next((i for i, c in enumerate(cols) if 'AMOUNT' in c.upper()), 0)
+
+        col_date = c1.selectbox("📅 Event Time/Date", cols, index=date_idx)
+        col_term = c2.selectbox("📟 Terminal SN", cols, index=term_idx)
+        col_amt = c3.selectbox("💷 Amount", cols, index=amt_idx)
+
+    # Process Data
+    df[col_date] = pd.to_datetime(df[col_date], errors='coerce')
+    df[col_amt] = pd.to_numeric(df[col_amt], errors='coerce')
+
+    # --- STEP 3: FILTER VIEW ---
+    st.divider()
+    st.subheader("2. Select Day & Terminal")
+    f1, f2 = st.columns(2)
+    
+    # Date Filter
+    unique_dates = sorted(df[col_date].dt.date.dropna().unique(), reverse=True)
+    selected_date = f1.selectbox("📅 Select Date", unique_dates)
+    
+    # Terminal Filter (Dependent on Date)
+    day_df = df[df[col_date].dt.date == selected_date]
+    unique_terminals = sorted(day_df[col_term].dropna().unique())
+    
+    if not unique_terminals:
+        st.warning("No transactions found for this date.")
+        return
+        
+    selected_terminal = f2.selectbox("📟 Select Terminal", unique_terminals)
+
+    # Filter DataFrame for Terminal
+    audit_df = day_df[day_df[col_term] == selected_terminal].sort_values(col_date)
+
+    # --- STEP 4: FIND THE DOCTOR ---
+    st.divider()
+    
+    practitioner_name, site_name = lookup_practitioner_info(selected_terminal, selected_date)
+    
+    if practitioner_name:
+        st.success(f"✅ **Identity Match:** Terminal `{selected_terminal}` belongs to **{practitioner_name}** ({site_name})")
+    else:
+        st.warning(f"⚠️ **Unknown Terminal:** Could not find assignment for `{selected_terminal}` in database.")
+        practitioner_name = st.text_input("Manually enter Practitioner Name to force check:")
+
+    # --- STEP 5: THE SIDE-BY-SIDE AUDIT ---
+    st.subheader("3. Side-by-Side Comparison")
+    
+    col_left, col_right = st.columns(2)
+
+    # 👈 LEFT SIDE: RAW BANK DATA
+    with col_left:
+        st.markdown(f"### 🏦 Bank CSV (Left Side)")
+        st.caption(f"Raw transactions from your uploaded file")
+        
+        bank_total = audit_df[col_amt].sum()
+        bank_count = len(audit_df)
+        
+        st.metric("Total Money In", f"£{bank_total:,.2f}", f"{bank_count} Transactions")
+        
+        # Display simplified table
+        display_cols = [col_date, col_amt]
+        # Add 'RESULT' if it exists to show Approved/Declined
+        result_col = next((c for c in df.columns if 'RESULT' in c.upper()), None)
+        if result_col: display_cols.append(result_col)
+        
+        # Format time for display
+        view_df = audit_df[display_cols].copy()
+        view_df[col_date] = view_df[col_date].dt.strftime('%H:%M:%S')
+        
+        st.dataframe(view_df, use_container_width=True, hide_index=True)
+
+    # 👉 RIGHT SIDE: SYSTEM DATA
+    with col_right:
+        st.markdown(f"### 💻 System Data (Right Side)")
+        
+        if practitioner_name:
+            st.caption(f"Invoices logged in database for **{practitioner_name}**")
+            
+            # Fetch Data
+            sys_df = load_system_invoices(practitioner_name, selected_date)
+            
+            if not sys_df.empty:
+                # Calculate Card Total (To compare apples to apples)
+                # We look for 'card' in payment method column
+                card_df = sys_df[sys_df['Method'].astype(str).str.lower().str.contains('card', na=False)]
+                sys_card_total = card_df['Paid £'].sum()
+                sys_count = len(card_df)
+                
+                # Difference Calculation
+                diff = bank_total - sys_card_total
+                
+                if diff == 0:
+                    delta_color = "normal"
+                    delta_msg = "✅ Perfect Match"
+                elif diff > 0:
+                    delta_color = "inverse" # Red
+                    delta_msg = f"💰 Bank has £{diff:.2f} MORE (Extra)"
+                else:
+                    delta_color = "inverse" # Red
+                    delta_msg = f"❌ Bank has £{abs(diff):.2f} LESS (Missing)"
+
+                st.metric("Expected (Card Only)", f"£{sys_card_total:,.2f}", delta_msg, delta_color=delta_color)
+                
+                # Display Table
+                st.dataframe(
+                    sys_df[['Time Logged', 'Patient', 'Method', 'Paid £', 'Invoice #']], 
+                    use_container_width=True, 
+                    hide_index=True
+                )
+            else:
+                st.warning("No invoices found in the system for this doctor/date.")
+                st.metric("Expected (Card Only)", "£0.00")
+        else:
+            st.info("Waiting for practitioner identification...")
+
 @st.cache_data(ttl=300)
 def load_revenue_by_practitioner():
     """Load revenue data grouped by practitioner"""
@@ -458,6 +669,7 @@ def render_sidebar():
         "Navigate",
         [
             "🔍 Pending Discrepancies",
+            "🕵️ Manual Audit",
             "✅ Resolved Discrepancies",
             "👤 Clinician Mapping",
             "💰 Revenue - Practitioners", 
@@ -815,8 +1027,12 @@ def render_clinician_mapping():
     st.title("👤 Clinician ID Mapping")
     
     st.markdown("""
-    Map CRM IDs (like `CPinuJuGPgGIkDDKsvnV`) to actual practitioner names.
-    This fixes reconciliation when the booking system uses internal IDs instead of names.
+    **Add CRM ID → Name mapping here.**  
+    When you add a mapping, it automatically:
+    1. ✅ Saves to `practitioner_id_mapping`
+    2. ✅ Updates `terminal_assignments` (fills crm_id)
+    3. ✅ Updates `practitioner_schedule` (fills crm_id)
+    4. ✅ Updates booking data (replaces CRM ID with name)
     """)
     
     # Add new mapping form
@@ -833,15 +1049,52 @@ def render_clinician_mapping():
     
     with col3:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("➕ Add", type="primary"):
+        if st.button("➕ Add & Sync", type="primary"):
             if new_crm_id and new_name:
                 add_clinician_mapping(new_crm_id.strip(), new_name.strip())
-                st.success(f"✅ Added: {new_crm_id} → {new_name}")
+                st.success(f"""
+                ✅ Added: {new_crm_id} → {new_name}
+                
+                Also updated:
+                - terminal_assignments
+                - practitioner_schedule  
+                - booking data
+                """)
                 st.rerun()
             else:
                 st.error("Please fill in both fields")
     
-    # Current mappings
+    # Show sync status
+    st.markdown("---")
+    st.subheader("📊 Sync Status")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Count terminal_assignments without crm_id
+        query = "SELECT COUNT(*) as count FROM terminal_assignments WHERE crm_id IS NULL"
+        result = fetch_dataframe(query)
+        count = result['count'].iloc[0] if not result.empty else 0
+        st.metric("🔌 Terminals Missing CRM ID", count)
+    
+    with col2:
+        # Count schedules without crm_id
+        query = "SELECT COUNT(*) as count FROM practitioner_schedule WHERE crm_id IS NULL"
+        result = fetch_dataframe(query)
+        count = result['count'].iloc[0] if not result.empty else 0
+        st.metric("📅 Schedules Missing CRM ID", count)
+    
+    with col3:
+        # Count bookings with CRM ID as name
+        query = """
+        SELECT COUNT(*) as count FROM clearearwax_finance_invoice_data 
+        WHERE LENGTH(practitioner) > 15 AND practitioner ~ '^[a-zA-Z0-9]+$'
+        """
+        result = fetch_dataframe(query)
+        count = result['count'].iloc[0] if not result.empty else 0
+        st.metric("📄 Bookings with CRM ID", count)
+    
+    # Current mappings (rest of the existing code...)
     st.markdown("---")
     st.subheader("📋 Current Mappings")
     
@@ -862,51 +1115,55 @@ def render_clinician_mapping():
                     st.caption(f"Added: {row['created_at']}")
             with col4:
                 if st.button("🗑️", key=f"del_{row['id']}"):
-                    delete_clinician_mapping(row['id'])
+                    delete_clinician_mapping(int(row['id']))
                     st.rerun()
     
-    # Apply mappings
+    # Bulk sync button
     st.markdown("---")
-    st.subheader("🔄 Apply Mappings to Booking Data")
+    st.subheader("🔄 Bulk Sync All Mappings")
     
-    st.warning("""
-    This will update the booking data table to replace CRM IDs with actual practitioner names.
-    Run this after adding new mappings, then re-run the reconciliation workflow.
-    """)
+    st.info("This will update ALL existing mappings across all tables.")
     
-    if st.button("🔄 Apply All Mappings", type="primary"):
-        update_booking_practitioner_names()
-        st.success("✅ Mappings applied! Now re-run the reconciliation workflow.")
-    
-    # Find unmapped IDs
-    st.markdown("---")
-    st.subheader("🔍 Find Unmapped CRM IDs")
-    
-    if st.button("🔍 Scan Booking Data"):
-        query = """
-        SELECT DISTINCT practitioner, COUNT(*) as count
-        FROM clearearwax_finance_invoice_data
-        WHERE LENGTH(practitioner) > 15
-          AND practitioner ~ '^[a-zA-Z0-9]+$'
-          AND practitioner NOT IN (SELECT crm_id FROM practitioner_id_mapping)
-        GROUP BY practitioner
-        ORDER BY count DESC
-        LIMIT 20
-        """
-        try:
-            unmapped = fetch_dataframe(query)
-            
-            if unmapped.empty:
-                st.success("✅ All CRM IDs are mapped!")
-            else:
-                st.warning(f"Found {len(unmapped)} unmapped CRM IDs:")
-                st.dataframe(unmapped, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error scanning: {e}")
+    if st.button("🔄 Sync All Mappings Now", type="secondary"):
+        sync_all_mappings()
+        st.success("✅ All mappings synced!")
+        st.rerun()
 
-# =============================================================================
-# PAGE: REVENUE BY PRACTITIONER
-# =============================================================================
+
+def sync_all_mappings():
+    """Sync all mappings to terminal_assignments, schedule, and bookings"""
+    
+    # Sync terminal_assignments
+    query1 = """
+    UPDATE terminal_assignments ta
+    SET crm_id = m.crm_id
+    FROM practitioner_id_mapping m
+    WHERE ta.crm_id IS NULL
+      AND LOWER(SPLIT_PART(ta.practitioner_name, ' ', 1)) = LOWER(SPLIT_PART(m.practitioner_name, ' ', 1))
+    """
+    execute_query(query1)
+    
+    # Sync practitioner_schedule
+    query2 = """
+    UPDATE practitioner_schedule ps
+    SET crm_id = m.crm_id
+    FROM practitioner_id_mapping m
+    WHERE ps.crm_id IS NULL
+      AND LOWER(SPLIT_PART(ps.practitioner, ' ', 1)) = LOWER(SPLIT_PART(m.practitioner_name, ' ', 1))
+    """
+    execute_query(query2)
+    
+    # Sync booking data
+    query3 = """
+    UPDATE clearearwax_finance_invoice_data f
+    SET practitioner = m.practitioner_name,
+        clinician_name = m.practitioner_name
+    FROM practitioner_id_mapping m
+    WHERE f.practitioner = m.crm_id OR f.clinician_name = m.crm_id
+    """
+    execute_query(query3)
+    
+    st.cache_data.clear()
 
 def render_revenue_practitioner_dashboard():
     """Render revenue by practitioner dashboard"""
@@ -1200,6 +1457,8 @@ def main():
     # Route to page
     if page == "🔍 Pending Discrepancies":
         render_pending_discrepancies()
+    elif page == "🕵️ Manual Audit":
+        render_manual_audit()
     elif page == "✅ Resolved Discrepancies":
         render_resolved_discrepancies()
     elif page == "👤 Clinician Mapping":
