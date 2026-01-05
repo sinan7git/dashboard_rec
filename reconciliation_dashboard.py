@@ -175,6 +175,27 @@ def load_transactions_for_practitioner(practitioner, date):
         'practitioner': practitioner.split()[0].lower() if practitioner else ''
     })
 
+@st.cache_data(ttl=60)
+def load_bank_feed_data(start_date, end_date):
+    """Load raw transactions from the merchant_transactions table"""
+    query = """
+    SELECT 
+        id,
+        trans_local_time as "Time",
+        terminal_sn as "Terminal",
+        trans_amount as "Amount",
+        result as "Status",
+        card_type as "Card Type",
+        brand as "Brand",
+        masked_pan as "Card Last 4",
+        merchant as "Merchant",
+        created_at as "Ingested At"
+    FROM merchant_transactions
+    WHERE trans_local_time::date BETWEEN :start_date AND :end_date
+    ORDER BY trans_local_time DESC
+    """
+    return fetch_dataframe(query, {'start_date': start_date, 'end_date': end_date})
+
 
 @st.cache_data(ttl=60)
 def load_clinician_mappings():
@@ -656,6 +677,77 @@ def color_occupancy(val):
     else:
         return 'background-color: #FF0000'
 
+def render_bank_feed_page():
+    """Render the Raw Bank Feed page"""
+    st.title("💳 Bank Feed (Merchant Transactions)")    
+    col_d1, col_d2 = st.columns(2)
+    start_date = col_d1.date_input("Start Date", datetime.now() - timedelta(days=7))
+    end_date = col_d2.date_input("End Date", datetime.now())
+
+    if start_date > end_date:
+        st.error("Start Date must be before End Date")
+        return
+
+    df = load_bank_feed_data(start_date, end_date)
+
+    with st.expander("🔎 Filter Transactions", expanded=True):
+        col1, col2 = st.columns(2)
+        
+        # Status Filter
+        status_filter = col1.selectbox("Status", ["All", "APPROVED", "DECLINED"])
+
+        # Terminal Filter (Populated from the loaded data)
+        if not df.empty:
+            # Get unique terminals present in the selected date range
+            available_terminals = sorted(df["Terminal"].unique().tolist())
+            terminal_options = ["All"] + available_terminals
+        else:
+            terminal_options = ["All"]
+            
+        terminal_filter = col2.selectbox("Terminal SN", terminal_options)
+
+    # --- 3. Apply Filters ---
+    if df.empty:
+        st.info("No transactions found for this date range.")
+        return
+
+    # Filter by Status
+    if status_filter != "All":
+        df = df[df["Status"] == status_filter]
+
+    # Filter by Terminal
+    if terminal_filter != "All":
+        df = df[df["Terminal"] == terminal_filter]
+
+    # --- 4. Metrics ---
+    st.markdown("---")
+    m1, m2, m3, m4 = st.columns(4)
+    
+    total_vol = df['Amount'].sum()
+    tx_count = len(df)
+    terminals_active = df['Terminal'].nunique()
+    latest_ingest = df['Ingested At'].max().strftime('%d/%m %H:%M') if not df.empty else "N/A"
+
+    m1.metric("💰 Total Volume", f"£{total_vol:,.2f}")
+    m2.metric("💳 Transactions", tx_count)
+    # m3.metric("Pp Active Terminals", terminals_active)
+    # m4.metric("📥 Latest Import", latest_ingest)
+
+    # --- 5. Data Table ---
+    st.markdown(f"### 📋 Transaction Log ({len(df)} records)")
+    
+    # Style the Status column
+    def color_status(val):
+        color = '#d4edda' if val == 'APPROVED' else '#f8d7da' # Green / Red
+        return f'background-color: {color}; color: black'
+
+    st.dataframe(
+        df.style.applymap(color_status, subset=['Status']),
+        use_container_width=True,
+        height=600
+    )
+
+
 # =============================================================================
 # SIDEBAR
 # =============================================================================
@@ -669,6 +761,7 @@ def render_sidebar():
         "Navigate",
         [
             "🔍 Pending Discrepancies",
+            "💳 Bank Feed (Merchant Transactions)",
             "🕵️ Manual Audit",
             "✅ Resolved Discrepancies",
             "👤 Clinician Mapping",
@@ -1457,6 +1550,8 @@ def main():
     # Route to page
     if page == "🔍 Pending Discrepancies":
         render_pending_discrepancies()
+    elif page == "💳 Bank Feed (Merchant Transactions)":
+        render_bank_feed_page()
     elif page == "🕵️ Manual Audit":
         render_manual_audit()
     elif page == "✅ Resolved Discrepancies":
