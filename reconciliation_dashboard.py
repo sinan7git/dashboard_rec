@@ -492,6 +492,109 @@ def load_revenue_by_practitioner():
     return fetch_dataframe(query)
 
 @st.cache_data(ttl=300)
+def load_invoice_revenue_by_practitioner():
+    """
+    Load revenue from invoices grouped by practitioner using strict total_amount logic.
+    Logic: If duplicate invoice_id_ref exists, prioritize the row where is_deposit=False
+    to capture the single source of truth for total_amount.
+    """
+    query = """
+    WITH RankedInvoices AS (
+        SELECT 
+            *,
+            -- LOGIC: Partition by invoice ID. 
+            -- Order by is_deposit ASC (False comes first).
+            -- If an invoice has a Deposit row and a Normal row, the Normal row becomes rn=1.
+            -- If it only has one row, that row becomes rn=1.
+            ROW_NUMBER() OVER (
+                PARTITION BY invoice_id_ref 
+                ORDER BY is_deposit ASC, id DESC
+            ) as rn
+        FROM clearearwax_finance_invoice_data
+        WHERE invoice_date >= CURRENT_DATE - INTERVAL '6 months' -- Adjust timeframe as needed
+    )
+    SELECT 
+        practitioner,
+        TO_CHAR(invoice_date, 'YYYY-MM') as year_month,
+        TO_CHAR(invoice_date, 'Mon YYYY') as month_display,
+        
+        -- Count unique invoices (only count row 1s)
+        COUNT(CASE WHEN rn = 1 THEN 1 END) as total_invoices,
+        
+        -- REVENUE CALCULATION:
+        -- Only take total_amount from the #1 ranked row (Non-deposit preferred)
+        SUM(CASE 
+            WHEN rn = 1 THEN total_amount 
+            ELSE 0 
+        END) as total_revenue,
+        
+        -- Breakdown Metrics (Optional: keeps payment_taken for accurate cash/card split)
+        SUM(CASE WHEN payment_method = 'card' THEN payment_taken ELSE 0 END) as card_payments,
+        SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END) as cash_payments,
+        
+        -- Deposit Tracking
+        SUM(CASE WHEN is_deposit = true THEN payment_taken ELSE 0 END) as deposit_amount,
+        
+        -- Source Counts (Unique Invoices)
+        COUNT(CASE WHEN rn = 1 AND source = 'Clear Earwax' THEN 1 END) as clearearwax_count,
+        COUNT(CASE WHEN rn = 1 AND source = 'Hearing Expert' THEN 1 END) as hearingexpert_count
+        
+    FROM RankedInvoices
+    GROUP BY practitioner, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
+    ORDER BY year_month DESC, total_revenue DESC
+    """
+    return fetch_dataframe(query)
+
+
+@st.cache_data(ttl=300)
+def load_invoice_revenue_by_site():
+    """Load revenue from invoices grouped by clinic/site"""
+    query = """
+    SELECT 
+        clinic as site,
+        TO_CHAR(invoice_date, 'YYYY-MM') as year_month,
+        TO_CHAR(invoice_date, 'Mon YYYY') as month_display,
+        
+        -- Count unique invoices
+        COUNT(DISTINCT invoice_id_ref) as total_invoices,
+        
+        -- Total revenue (avoid duplicates)
+        SUM(CASE 
+            WHEN rn = 1 THEN total_amount 
+            ELSE 0 
+        END) as total_revenue,
+        
+        -- Payments by method
+        SUM(CASE WHEN payment_method = 'card' THEN payment_taken ELSE 0 END) as card_payments,
+        SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END) as cash_payments,
+        SUM(CASE WHEN payment_method = 'other' THEN payment_taken ELSE 0 END) as other_payments,
+        
+        -- Deposit tracking
+        SUM(CASE WHEN is_deposit THEN payment_taken ELSE 0 END) as deposit_amount,
+        COUNT(DISTINCT CASE WHEN is_deposit THEN invoice_id_ref END) as deposit_count,
+        
+        -- Average
+        CASE 
+            WHEN COUNT(DISTINCT invoice_id_ref) > 0 
+            THEN ROUND((SUM(CASE WHEN rn = 1 THEN total_amount ELSE 0 END)::numeric / COUNT(DISTINCT invoice_id_ref)), 2)
+            ELSE 0
+        END as avg_per_invoice,
+        
+        -- Practitioners working at this site
+        COUNT(DISTINCT practitioner) as practitioner_count
+        
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (PARTITION BY invoice_id_ref ORDER BY id) as rn
+        FROM clearearwax_finance_invoice_data
+        WHERE invoice_date >= CURRENT_DATE - INTERVAL '90 days'
+    ) ranked
+    GROUP BY clinic, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
+    ORDER BY year_month DESC, total_revenue DESC
+    """
+    return fetch_dataframe(query)
+
+@st.cache_data(ttl=300)
 def load_revenue_by_site():
     """Load revenue data grouped by site"""
     query = """
@@ -566,6 +669,58 @@ def load_monthly_summary():
 # DATABASE UPDATE FUNCTIONS
 # =============================================================================
 
+def fetch_all_clinic_names():
+    """
+    Fetch ALL distinct clinic names found in the database (no exclusions).
+    """
+    query = """
+    SELECT DISTINCT clinic 
+    FROM clearearwax_finance_invoice_data 
+    WHERE clinic IS NOT NULL 
+      AND clinic != ''
+    ORDER BY clinic
+    """
+    df = fetch_dataframe(query)
+    return df['clinic'].tolist() if not df.empty else []
+
+def fetch_invoices_by_clinic_text(clinic_name):
+    """
+    Fetch invoices matching a specific text string in the clinic column.
+    """
+    query = """
+    SELECT 
+        id,
+        invoice_number,
+        invoice_date,
+        contact_name,
+        total_amount,
+        clinic as current_clinic_name,
+        practitioner
+    FROM clearearwax_finance_invoice_data
+    WHERE clinic = :clinic_name
+    ORDER BY invoice_date DESC
+    """
+    return fetch_dataframe(query, {'clinic_name': clinic_name})
+
+def bulk_update_clinic_name(invoice_ids, new_clinic_name):
+    """
+    Update the clinic name for a list of invoice IDs.
+    """
+    if not invoice_ids:
+        return False
+        
+    # REMOVED 'updated_at = NOW()' because the column does not exist
+    query = """
+    UPDATE clearearwax_finance_invoice_data
+    SET clinic = :new_name
+    WHERE id = ANY(:ids)
+    """
+    
+    # Pass IDs as a list
+    result = execute_query(query, {'new_name': new_clinic_name, 'ids': list(invoice_ids)})
+    st.cache_data.clear()
+    return True
+
 def mark_discrepancy_resolved(discrepancy_id, resolved_by, resolution_notes='', update_revenue=True, manual_site=None):
     """Mark discrepancy as resolved and optionally update revenue_data"""
     
@@ -584,15 +739,22 @@ def mark_discrepancy_resolved(discrepancy_id, resolved_by, resolution_notes='', 
     # STEP 0: Handle NULL/Unknown Site
     # =====================================================================
     site_value = disc['site']
+    session_value = disc['session_slot']
+
+
     
     # If site is NULL/Unknown - MUST have manual selection
-    if not site_value or site_value.lower() in ['unknown', 'null', 'none', '', 'no schedule']:
+    site_is_invalid = not site_value or site_value.lower() in ['unknown', 'null', 'none', '', 'no schedule']
+    session_is_invalid = not session_value or session_value.lower() in ['n/a', 'null', 'none', '']
+
+    if site_is_invalid or session_is_invalid:
         if not manual_site:
-            st.error("❌ **Site is missing! Please select a site manually before resolving.**")
+            st.error("❌ **Site is missing or no session scheduled! Please select a site manually before resolving.**")
             return False
         else:
             site_value = manual_site
             st.info(f"📍 Using manually selected site: **{site_value}**")
+
     
     # =====================================================================
     # STEP 1: Get ACTUAL bank transaction total
@@ -732,6 +894,234 @@ def color_occupancy(val):
     else:
         return 'background-color: #FF0000'
 
+def render_invoice_revenue_practitioner_dashboard():
+    """Render invoice-based revenue by practitioner dashboard (Total Amount Logic)"""
+    st.markdown("## 💰 Invoiced Revenue - Practitioner View")
+    
+    # Load the new data
+    df = load_invoice_revenue_by_practitioner()
+    
+    if df.empty:
+        st.warning("No invoice data found.")
+        return
+    
+    # --- FILTERS ---
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        months = ['All'] + sorted(df['year_month'].dropna().unique().tolist(), reverse=True)
+        selected_month = st.selectbox("📅 Month", months, key="inv_pract_month_v2")
+    
+    with col2:
+        practitioners = ['All'] + sorted(df['practitioner'].dropna().unique().tolist())
+        selected_practitioner = st.selectbox("👤 Practitioner", practitioners, key="inv_pract_name_v2")
+    
+    # Apply filters
+    filtered_df = df.copy()
+    
+    if selected_month != 'All':
+        filtered_df = filtered_df[filtered_df['year_month'] == selected_month]
+    if selected_practitioner != 'All':
+        filtered_df = filtered_df[filtered_df['practitioner'] == selected_practitioner]
+    
+    # --- METRICS ---
+    st.markdown("---")
+    
+    # Calculate totals
+    total_rev = filtered_df['total_revenue'].sum()
+    total_inv = filtered_df['total_invoices'].sum()
+    
+    m1, m2, m3, m4 = st.columns(4)
+    
+    with m1:
+        st.metric("💰 Total Invoiced Revenue", f"£{total_rev:,.2f}", help="Sum of Total Amount (deduplicated)")
+    with m2:
+        st.metric("📄 Unique Invoices", f"{total_inv:,}")
+    with m3:
+        avg = total_rev / max(total_inv, 1)
+        st.metric("📊 Avg Invoice Value", f"£{avg:.2f}")
+    with m4:
+        st.metric("🏦 Deposit Value", f"£{filtered_df['deposit_amount'].sum():,.2f}", help="Portion of revenue collected as deposits")
+    
+    # --- CHARTS ---
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    
+    with c1:
+        st.subheader("💰 Revenue by Practitioner")
+        if not filtered_df.empty:
+            # Grouping again in case 'All' months selected to aggregate practitioner totals
+            pract_rev = filtered_df.groupby('practitioner')['total_revenue'].sum().sort_values(ascending=True).tail(15)
+            
+            fig = px.bar(
+                x=pract_rev.values, 
+                y=pract_rev.index, 
+                orientation='h',
+                text_auto='.2s',
+                color=pract_rev.values, 
+                color_continuous_scale='Greens',
+                labels={'x': 'Total Amount (£)', 'y': 'Practitioner'}
+            )
+            fig.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with c2:
+        st.subheader("📄 Volume by Practitioner")
+        if not filtered_df.empty:
+            pract_inv = filtered_df.groupby('practitioner')['total_invoices'].sum().sort_values(ascending=True).tail(15)
+            
+            fig = px.bar(
+                x=pract_inv.values, 
+                y=pract_inv.index, 
+                orientation='h',
+                text_auto=True,
+                color=pract_inv.values, 
+                color_continuous_scale='Blues',
+                labels={'x': 'Count', 'y': 'Practitioner'}
+            )
+            fig.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+            
+    # --- TABLE ---
+    st.markdown("---")
+    st.subheader("📋 Detailed Breakdown")
+    
+    summary_df = filtered_df.groupby('practitioner').agg({
+        'total_invoices': 'sum',
+        'total_revenue': 'sum',
+        'card_payments': 'sum', # Note: This is still payment_taken sum
+        'cash_payments': 'sum', # Note: This is still payment_taken sum
+        'deposit_amount': 'sum',
+        'clearearwax_count': 'sum',
+        'hearingexpert_count': 'sum'
+    }).reset_index()
+    
+    # Sort by Revenue
+    summary_df = summary_df.sort_values('total_revenue', ascending=False)
+    
+    st.dataframe(
+        summary_df.rename(columns={
+            'practitioner': 'Practitioner',
+            'total_invoices': 'Invoices',
+            'total_revenue': 'Total Amount (£)',
+            'card_payments': 'Card Paid (£)',
+            'cash_payments': 'Cash Paid (£)',
+            'deposit_amount': 'Deposits (£)',
+            'clearearwax_count': 'CEW Count',
+            'hearingexpert_count': 'HE Count'
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+# =============================================================================
+# PAGE: INVOICE REVENUE BY SITE
+# =============================================================================
+
+def render_invoice_revenue_site_dashboard():
+    """Render invoice-based revenue by site/clinic dashboard"""
+    st.title("🏥 Invoice Revenue - By Site")
+    st.caption("📄 Based on actual invoices from clearearwax_finance_invoice_data")
+    
+    df = load_invoice_revenue_by_site()
+    
+    if df.empty:
+        st.warning("No invoice data found.")
+        return
+    
+    # Filters
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        months = ['All'] + sorted(df['year_month'].dropna().unique().tolist(), reverse=True)
+        selected_month = st.selectbox("📅 Month", months, key="inv_site_month")
+    
+    with col2:
+        sites = ['All'] + sorted(df['site'].dropna().unique().tolist())
+        selected_site = st.selectbox("📍 Site", sites, key="inv_site_name")
+    
+    # Apply filters
+    filtered_df = df.copy()
+    
+    if selected_month != 'All':
+        filtered_df = filtered_df[filtered_df['year_month'] == selected_month]
+    if selected_site != 'All':
+        filtered_df = filtered_df[filtered_df['site'] == selected_site]
+    
+    # Metrics
+    st.markdown("---")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        st.metric("💰 Revenue", f"£{filtered_df['total_revenue'].sum():,.2f}")
+    with col2:
+        st.metric("🏥 Sites", f"{filtered_df['site'].nunique()}")
+    with col3:
+        st.metric("📄 Invoices", f"{filtered_df['total_invoices'].sum():,}")
+    with col4:
+        st.metric("💳 Card", f"£{filtered_df['card_payments'].sum():,.2f}")
+    with col5:
+        st.metric("👥 Practitioners", f"{filtered_df['practitioner_count'].sum()}")
+    
+    # Charts
+    st.markdown("---")
+    chart_col1, chart_col2 = st.columns(2)
+    
+    with chart_col1:
+        st.subheader("💰 Revenue by Site")
+        if not filtered_df.empty:
+            site_rev = filtered_df.groupby('site')['total_revenue'].sum().sort_values(ascending=True).tail(15)
+            fig = px.bar(x=site_rev.values, y=site_rev.index, orientation='h',
+                        color=site_rev.values, color_continuous_scale='Greens')
+            fig.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with chart_col2:
+        st.subheader("📄 Invoice Count by Site")
+        if not filtered_df.empty:
+            site_inv = filtered_df.groupby('site')['total_invoices'].sum().sort_values(ascending=True).tail(15)
+            fig = px.bar(x=site_inv.values, y=site_inv.index, orientation='h',
+                        color=site_inv.values, color_continuous_scale='Blues')
+            fig.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # Data table
+    st.markdown("---")
+    st.subheader("📋 Site Summary")
+    
+    summary_df = filtered_df.groupby('site').agg({
+        'total_invoices': 'sum',
+        'total_revenue': 'sum',
+        'card_payments': 'sum',
+        'cash_payments': 'sum',
+        'other_payments': 'sum',
+        'deposit_amount': 'sum',
+        'practitioner_count': 'sum'
+    }).reset_index()
+    
+    summary_df['avg_per_invoice'] = (summary_df['total_revenue'] / summary_df['total_invoices'].replace(0, 1)).round(2)
+    
+    st.dataframe(
+        summary_df.rename(columns={
+            'site': 'Site',
+            'total_invoices': 'Invoices',
+            'total_revenue': 'Revenue',
+            'card_payments': 'Card',
+            'cash_payments': 'Cash',
+            'other_payments': 'Other',
+            'deposit_amount': 'Deposits',
+            'avg_per_invoice': 'Avg/Invoice',
+            'practitioner_count': 'Practitioners'
+        }).sort_values('Revenue', ascending=False),
+        use_container_width=True,
+        height=400
+    )
+    
+    csv = summary_df.to_csv(index=False)
+    st.download_button("📥 Download CSV", data=csv,
+                      file_name=f"invoice_revenue_sites_{datetime.now().strftime('%Y%m%d')}.csv",
+                      mime="text/csv")
+
 def render_bank_feed_page():
     """Render the Raw Bank Feed page"""
     st.title("💳 Bank Feed (Merchant Transactions)")    
@@ -802,6 +1192,109 @@ def render_bank_feed_page():
         height=600
     )
 
+def render_clinic_cleanup_page():
+    """Render the Clinic Name Cleanup / Override tool"""
+    st.title("🏥 Clinic Name Cleanup")
+    st.markdown("""
+    **Manage Clinic Names.** Select a clinic name from the list below (Source), select the invoices you want to move, and choose the correct name (Target).
+    """)
+    
+    # Fetch ALL names found in the DB
+    all_clinics = fetch_all_clinic_names()
+    
+    if not all_clinics:
+        st.warning("No clinic names found in the database.")
+        return
+
+    # --- Step 1: Source Selection (OUTSIDE FORM so it updates immediately) ---
+    st.subheader("1. Source: Select Clinic Name to Fix")
+    
+    selected_source = st.selectbox(
+        "Select the name currently on the invoices:", 
+        all_clinics,
+        key="source_clinic_select"
+    )
+    
+    # Load invoices for the selected source
+    df = fetch_invoices_by_clinic_text(selected_source)
+    
+    if df.empty:
+        st.warning(f"No invoices found under the name '{selected_source}'.")
+        return
+        
+    # Add a 'Select' column for the user to check
+    # Check if 'Select' already exists to avoid errors, otherwise add it
+    if "Select" not in df.columns:
+        df.insert(0, "Select", False)
+    
+    st.markdown("---")
+    st.subheader(f"2. Select Invoices & Rename")
+
+    # --- START FORM ---
+    # Everything inside this 'with' block will NOT trigger a reload until the button is clicked
+    with st.form(key="cleanup_form"):
+        
+        # 1. The Table
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select", default=False),
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "invoice_number": st.column_config.TextColumn("Invoice #", disabled=True),
+                "invoice_date": st.column_config.DateColumn("Date", disabled=True),
+                "total_amount": st.column_config.NumberColumn("Total", format="£%.2f", disabled=True),
+                "current_clinic_name": st.column_config.TextColumn("Current Name", disabled=True),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key="clinic_cleanup_editor"
+        )
+        
+        st.markdown("### 3. Choose Target Name")
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            target_options = all_clinics + ["-- New / Custom Name --"]
+            target_selection = st.selectbox("Select the correct name:", target_options)
+            
+            # Note: We can't conditionally show a text input effectively INSIDE a form 
+            # based on a selection made INSIDE the same form (because it requires a rerun).
+            # So we show the text input always, but only use it if "Custom" is picked.
+            custom_name_input = st.text_input("If 'New/Custom', type name here:")
+        
+        with col2:
+            st.markdown("<br><br>", unsafe_allow_html=True)
+            # This is the form submit button
+            submit_button = st.form_submit_button("🚀 Rename Selected Invoices", type="primary")
+
+    # --- HANDLE SUBMISSION (OUTSIDE FORM) ---
+    if submit_button:
+        # Determine the final target name
+        final_target_name = target_selection
+        if target_selection == "-- New / Custom Name --":
+            final_target_name = custom_name_input
+        
+        # Get selected IDs from the edited dataframe
+        selected_rows = edited_df[edited_df["Select"] == True]
+        selected_ids = selected_rows['id'].tolist()
+        count_selected = len(selected_ids)
+
+        # Validation Logic
+        if count_selected == 0:
+            st.error("❌ You didn't select any invoices in the table.")
+        elif not final_target_name:
+            st.error("❌ Target name is empty.")
+        elif final_target_name == selected_source:
+            st.warning("⚠️ Source and Target names are the same. No changes made.")
+        else:
+            # Execute Update
+            success = bulk_update_clinic_name(selected_ids, final_target_name)
+            if success:
+                st.success(f"✅ Successfully moved {count_selected} invoices from **'{selected_source}'** to **'{final_target_name}'**!")
+                # Optional: Rerun manually to refresh the table and remove the moved rows
+                st.rerun()
+            else:
+                st.error("Failed to update database.")
 
 # =============================================================================
 # SIDEBAR
@@ -818,11 +1311,14 @@ def render_sidebar():
             "🔍 Pending Discrepancies",
             "💳 Bank Feed (Merchant Transactions)",
             "🕵️ Manual Audit",
+            "🏥 Clinic Name Cleanup",
             "✅ Resolved Discrepancies",
             "👤 Clinician Mapping",
             "💰 Revenue - Practitioners", 
             "🏥 Revenue - Sites", 
-            "📈 Monthly Overview"
+            "📈 Monthly Overview",
+            "📄 Invoice Revenue - Practitioners", 
+            "🏪 Invoice Revenue - Sites"
         ]
     )
     
@@ -1043,12 +1539,23 @@ def render_discrepancy_detail(discrepancy):
             placeholder="Your name",
             key=f"resolver_{discrepancy['id']}"
         )
+
     site_override = None
-    if not discrepancy['site'] or discrepancy['site'].lower() in ['unknown', 'null', 'none','no schedule', '']:
-        st.warning("⚠️ **Site is REQUIRED but missing!**")
+    site_is_invalid = (not discrepancy['site'] or 
+                   discrepancy['site'].lower() in ['unknown', 'null', 'none', '', 'no schedule'])
+
+# Check if session is invalid (N/A means no schedule)
+    session_is_invalid = (not discrepancy['session_slot'] or 
+                        discrepancy['session_slot'].lower() in ['n/a', 'null', 'none', ''])
+
+    if site_is_invalid or session_is_invalid:
+        if site_is_invalid:
+            st.warning(f"⚠️ **Site is REQUIRED but shows: '{discrepancy['site']}'**")
+        if session_is_invalid:
+            st.warning(f"⚠️ **Session is '{discrepancy['session_slot']}' (No Schedule) - Site required!**")
         
         # Get all available sites
-        sites_query = "SELECT DISTINCT site FROM revenue_data WHERE site IS NOT NULL ORDER BY site"
+        sites_query = "SELECT DISTINCT site FROM revenue_data WHERE site IS NOT NULL AND site != '' ORDER BY site"
         sites_df = fetch_dataframe(sites_query)
         
         if not sites_df.empty:
@@ -1790,6 +2297,8 @@ def main():
         render_bank_feed_page()
     elif page == "🕵️ Manual Audit":
         render_manual_audit()
+    elif page == "🏥 Clinic Name Cleanup":  
+        render_clinic_cleanup_page()
     elif page == "✅ Resolved Discrepancies":
         render_resolved_discrepancies()
     elif page == "👤 Clinician Mapping":
@@ -1800,6 +2309,10 @@ def main():
         render_revenue_site_dashboard()
     elif page == "📈 Monthly Overview":
         render_monthly_overview()
+    elif page == "📄 Invoice Revenue - Practitioners":
+        render_invoice_revenue_practitioner_dashboard()
+    elif page == "🏪 Invoice Revenue - Sites":
+        render_invoice_revenue_site_dashboard()
     
     # Footer
     st.markdown("---")
