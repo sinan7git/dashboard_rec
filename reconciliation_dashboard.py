@@ -566,16 +566,13 @@ def load_monthly_summary():
 # DATABASE UPDATE FUNCTIONS
 # =============================================================================
 
-def mark_discrepancy_resolved(discrepancy_id, resolved_by, resolution_notes='', update_revenue=True):
+def mark_discrepancy_resolved(discrepancy_id, resolved_by, resolution_notes='', update_revenue=True, manual_site=None):
     """Mark discrepancy as resolved and optionally update revenue_data"""
     
-    # Convert numpy.int64 to Python int
     discrepancy_id = int(discrepancy_id)
     
-    # First, get the discrepancy details
-    disc_query = """
-    SELECT * FROM reconciliation_discrepancies WHERE id = :id
-    """
+    # Get discrepancy details
+    disc_query = "SELECT * FROM reconciliation_discrepancies WHERE id = :id"
     disc_df = fetch_dataframe(disc_query, {'id': discrepancy_id})
     
     if disc_df.empty:
@@ -583,13 +580,77 @@ def mark_discrepancy_resolved(discrepancy_id, resolved_by, resolution_notes='', 
     
     disc = disc_df.iloc[0]
     
-    # Update the discrepancy status
+    # =====================================================================
+    # STEP 0: Handle NULL/Unknown Site
+    # =====================================================================
+    site_value = disc['site']
+    
+    # If site is NULL/Unknown - MUST have manual selection
+    if not site_value or site_value.lower() in ['unknown', 'null', 'none', '', 'no schedule']:
+        if not manual_site:
+            st.error("❌ **Site is missing! Please select a site manually before resolving.**")
+            return False
+        else:
+            site_value = manual_site
+            st.info(f"📍 Using manually selected site: **{site_value}**")
+    
+    # =====================================================================
+    # STEP 1: Get ACTUAL bank transaction total
+    # =====================================================================
+    if update_revenue:
+        bank_query = """
+        SELECT COALESCE(SUM(trans_amount), 0) as actual_bank_total
+        FROM merchant_transactions
+        WHERE terminal_sn = :terminal
+          AND trans_local_time::date = :date
+          AND result = 'APPROVED'
+        """
+        bank_df = fetch_dataframe(bank_query, {
+            'terminal': str(disc['terminal']),
+            'date': disc['reconciliation_date']
+        })
+        
+        actual_bank_total = float(bank_df.iloc[0]['actual_bank_total']) if not bank_df.empty else 0
+        st.info(f"🏦 Actual Bank Total: £{actual_bank_total:.2f}")
+    
+    # =====================================================================
+    # STEP 2: UPSERT to revenue_data
+    # =====================================================================
+    if update_revenue:
+        upsert_query = """
+        INSERT INTO revenue_data (
+            practitioner, appointment_date, site, session_slot,
+            card, revenue, appointments, net_appointments, day_of_week, created_at
+        )
+        VALUES (
+            :practitioner, :date, :site, :session_slot,
+            :card_amount, :card_amount, 
+            COALESCE(:booking_count, 0), COALESCE(:booking_count, 0),
+            TO_CHAR(:date::date, 'Day'), NOW()
+        )
+        ON CONFLICT (practitioner, appointment_date, site, session_slot)
+        DO UPDATE SET
+            card = :card_amount,
+            revenue = EXCLUDED.card + revenue_data.cash
+        """
+        
+        execute_query(upsert_query, {
+            'practitioner': str(disc['practitioner']),
+            'date': disc['reconciliation_date'],
+            'site': site_value,  # Manual selection or existing value
+            'session_slot': str(disc['session_slot']) if disc['session_slot'] else '',
+            'card_amount': actual_bank_total,
+            'booking_count': int(disc['booking_count']) if pd.notna(disc['booking_count']) else 0
+        })
+        
+        st.success(f"✅ Updated: {disc['practitioner']} | {site_value} | £{actual_bank_total:.2f}")
+    
+    # =====================================================================
+    # STEP 3: Mark as resolved
+    # =====================================================================
     update_disc_query = """
     UPDATE reconciliation_discrepancies 
-    SET status = 'resolved',
-        resolved_at = NOW(),
-        resolved_by = :resolved_by,
-        resolution_notes = :notes
+    SET status = 'resolved', resolved_at = NOW(), resolved_by = :resolved_by, resolution_notes = :notes
     WHERE id = :id
     """
     execute_query(update_disc_query, {
@@ -598,32 +659,6 @@ def mark_discrepancy_resolved(discrepancy_id, resolved_by, resolution_notes='', 
         'notes': resolution_notes
     })
     
-    # Optionally update revenue_data to reconcile the amounts
-    if update_revenue and disc['type'] == 'extra_in_bank':
-        # Extra in bank - update card to match actual transaction amount
-        update_revenue_query = """
-        UPDATE revenue_data 
-        SET card = :new_card,
-            revenue = :new_card + cash
-        WHERE LOWER(SPLIT_PART(practitioner, ' ', 1)) = LOWER(SPLIT_PART(:practitioner, ' ', 1))
-          AND appointment_date = :date
-          AND LOWER(site) = LOWER(:site)
-          AND (
-            session_slot = :session_slot 
-            OR (:session_slot = '' AND (session_slot IS NULL OR session_slot = ''))
-            OR session_slot IS NULL
-          )
-        """
-        
-        execute_query(update_revenue_query, {
-            'new_card': float(disc['transaction_total']),
-            'practitioner': str(disc['practitioner'] or ''),
-            'date': disc['reconciliation_date'],
-            'site': str(disc['site'] or ''),
-            'session_slot': str(disc['session_slot'] or '')
-        })
-    
-    # Clear cache to refresh data
     st.cache_data.clear()
     return True
 
@@ -1008,6 +1043,27 @@ def render_discrepancy_detail(discrepancy):
             placeholder="Your name",
             key=f"resolver_{discrepancy['id']}"
         )
+    site_override = None
+    if not discrepancy['site'] or discrepancy['site'].lower() in ['unknown', 'null', 'none','no schedule', '']:
+        st.warning("⚠️ **Site is REQUIRED but missing!**")
+        
+        # Get all available sites
+        sites_query = "SELECT DISTINCT site FROM revenue_data WHERE site IS NOT NULL ORDER BY site"
+        sites_df = fetch_dataframe(sites_query)
+        
+        if not sites_df.empty:
+            available_sites = sites_df['site'].tolist()
+            site_override = st.selectbox(
+                "📍 Select Site (Required)",
+                options=['-- Select Site --'] + available_sites,
+                key=f"site_override_{discrepancy['id']}"
+            )
+            
+            if site_override == '-- Select Site --':
+                site_override = None
+                st.error("👆 Please select a site above before resolving")
+        else:
+            st.error("❌ No sites found in database!")
     
     # Resolution type options
     st.markdown("**Resolution Type:**")
@@ -1043,7 +1099,8 @@ def render_discrepancy_detail(discrepancy):
                 discrepancy['id'], 
                 resolved_by, 
                 full_notes,
-                update_revenue=update_revenue
+                update_revenue=update_revenue,
+                manual_site=site_override
             )
             st.success("✅ Discrepancy resolved!")
             st.rerun()
