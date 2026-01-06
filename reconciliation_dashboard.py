@@ -117,6 +117,7 @@ def load_discrepancies(status_filter='all'):
     
     return fetch_dataframe(query)
 
+
 def load_invoices_for_discrepancy(practitioner, date, site):
     """Load invoices matching a discrepancy"""
     query = """
@@ -124,10 +125,11 @@ def load_invoices_for_discrepancy(practitioner, date, site):
         id,
         invoice_number,
         practitioner,
-        clinic,
+        clinic as site,
         total_amount,
         payment_taken,
         invoice_date,
+        created_at,  
         service_provided,
         contact_name,
         contact_email,
@@ -141,7 +143,7 @@ def load_invoices_for_discrepancy(practitioner, date, site):
         LOWER(SPLIT_PART(practitioner, ' ', 1)) = LOWER(:practitioner)
         OR LOWER(practitioner) = LOWER(:practitioner)
       )
-    ORDER BY invoice_date
+    ORDER BY created_at  -- Changed from invoice_date
     """
     return fetch_dataframe(query, {
         'date': date, 
@@ -174,6 +176,24 @@ def load_transactions_for_practitioner(practitioner, date):
         'date': date, 
         'practitioner': practitioner.split()[0].lower() if practitioner else ''
     })
+
+def load_bank_transactions_for_discrepancy(terminal, date):
+    """Load raw bank transactions for a specific terminal and date"""
+    query = """
+    SELECT 
+        TO_CHAR(trans_local_time, 'HH24:MI:SS') as time,
+        trans_amount as amount,
+        result as status,
+        card_type,
+        brand,
+        CONCAT('****', masked_pan) as card_number
+    FROM merchant_transactions
+    WHERE terminal_sn = :terminal
+      AND trans_local_time::date = :date
+    ORDER BY trans_local_time ASC
+    """
+    return fetch_dataframe(query, {'terminal': str(terminal), 'date': date})
+
 
 @st.cache_data(ttl=60)
 def load_bank_feed_data(start_date, end_date):
@@ -816,24 +836,137 @@ def render_discrepancy_detail(discrepancy):
         st.markdown(f"**Transactions:** £{discrepancy['transaction_total']:.2f} ({int(discrepancy['transaction_count'])})")
         st.markdown(f"**Difference:** £{discrepancy['difference']:.2f}")
     
-    # Load and display related invoices
-    st.markdown("#### 📄 Related Invoices")
-    invoices = load_invoices_for_discrepancy(
-        discrepancy['practitioner'],
-        discrepancy['reconciliation_date'],
-        discrepancy['site']
-    )
+    # ========================================================================
+    # SIDE-BY-SIDE COMPARISON: INVOICES vs BANK TRANSACTIONS
+    # ========================================================================
+    st.markdown("---")
     
-    if not invoices.empty:
-        display_cols = ['invoice_number','clinic', 'contact_name', 'service_provided', 
-                       'total_amount', 'payment_taken', 'payment_method', 'source']
-        display_cols = [c for c in display_cols if c in invoices.columns]
-        st.dataframe(invoices[display_cols], use_container_width=True, height=150)
-    else:
-        st.info("No invoices found. This might be due to clinician name mismatch (CRM ID vs Name).")
+    col_left, col_right = st.columns(2)
     
-    # Load and display transactions
-    st.markdown("#### 💳 Related Transactions (from revenue_data)")
+    # LEFT SIDE: System Invoices (What we EXPECTED)
+    with col_left:
+        st.markdown("#### 📄 System Invoices")
+        st.caption(f"Card payments logged for {discrepancy['practitioner']}")
+        
+        invoices = load_invoices_for_discrepancy(
+            discrepancy['practitioner'],
+            discrepancy['reconciliation_date'],
+            discrepancy['site']
+        )
+        
+        if not invoices.empty:
+            # Filter for card payments only
+            card_invoices = invoices[invoices['payment_method'].str.lower().str.contains('card', na=False)]
+            
+            # Calculate totals
+            invoice_total = card_invoices['payment_taken'].sum()
+            invoice_count = len(card_invoices)
+            
+            # Show metrics
+            st.metric("Expected Total (Card)", f"£{invoice_total:.2f}", f"{invoice_count} Invoices")
+            
+            # Show table - USE created_at instead of invoice_date
+            display_cols = ['invoice_date', 'site', 'contact_name', 'service_provided', 'payment_taken', 'invoice_number','total_amount']
+            display_cols = [c for c in display_cols if c in card_invoices.columns]
+            
+            # Format time from created_at
+            display_df = card_invoices[display_cols].copy()
+            if 'created_at' in display_df.columns:
+                display_df['created_at'] = pd.to_datetime(display_df['created_at']).dt.strftime('%H:%M')
+            
+            st.dataframe(
+                display_df.rename(columns={
+                    'invoice_date': 'Date',
+                    'site': 'Site',
+                    'contact_name': 'Patient',
+                    'service_provided': 'Service',
+                    'payment_taken': 'Amount £',
+                    'invoice_number': 'Invoice #',
+                    'total_amount': 'Total £'
+                }),
+                use_container_width=True,
+                height=300,
+                hide_index=True
+            )
+        else:
+            st.warning("⚠️ No invoices found")
+            st.caption("This might be due to clinician name mismatch (CRM ID vs Name)")
+            st.metric("Expected Total (Card)", "£0.00")
+    # RIGHT SIDE: Raw Bank Transactions (What ACTUALLY happened)
+    with col_right:
+        st.markdown("#### 🏦 Bank Transaction Log ")
+        st.caption(f"Raw transactions from Terminal {discrepancy['terminal']}")
+        
+        bank_transactions = load_bank_transactions_for_discrepancy(
+            discrepancy['terminal'],
+            discrepancy['reconciliation_date']
+        )
+        
+        if not bank_transactions.empty:
+            # Filter approved only
+            approved_tx = bank_transactions[bank_transactions['status'] == 'APPROVED']
+            
+            # Calculate totals
+            bank_total = approved_tx['amount'].sum()
+            bank_count = len(approved_tx)
+            
+            # Calculate difference
+            if not invoices.empty:
+                card_invoices = invoices[invoices['payment_method'].str.lower().str.contains('card', na=False)]
+                expected_total = card_invoices['payment_taken'].sum()
+                difference = bank_total - expected_total
+                
+                if difference == 0:
+                    delta_msg = "✅ Perfect Match"
+                    delta_color = "normal"
+                elif difference > 0:
+                    delta_msg = f"💰 +£{difference:.2f} Extra"
+                    delta_color = "inverse"
+                else:
+                    delta_msg = f"❌ -£{abs(difference):.2f} Missing"
+                    delta_color = "inverse"
+            else:
+                delta_msg = "No invoices to compare"
+                delta_color = "off"
+            
+            # Show metrics
+            st.metric("Actual Total (Bank)", f"£{bank_total:.2f}", delta_msg, delta_color=delta_color)
+            
+            # Show table
+            st.dataframe(
+                approved_tx.rename(columns={
+                    'time': 'Time',
+                    'amount': 'Amount £',
+                    'status': 'Status',
+                    'card_type': 'Card Type',
+                    'card_number': 'Card #'
+                }),
+                use_container_width=True,
+                height=300,
+                hide_index=True
+            )
+            
+            # Show declined transactions if any
+            declined_tx = bank_transactions[bank_transactions['status'] != 'APPROVED']
+            if not declined_tx.empty:
+                with st.expander(f"⚠️ {len(declined_tx)} Declined Transactions (Not Counted)", expanded=False):
+                    st.dataframe(
+                        declined_tx.rename(columns={
+                            'time': 'Time',
+                            'amount': 'Amount £',
+                            'status': 'Status'
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+        else:
+            st.warning("⚠️ No bank transactions found")
+            st.caption(f"No transactions logged for Terminal {discrepancy['terminal']} on this date")
+            st.metric("Actual Total (Bank)", "£0.00")
+    
+    # Additional context from revenue_data
+    st.markdown("---")
+    st.markdown("#### 📊 Additional Context (Revenue Data Summary)")
     transactions = load_transactions_for_practitioner(
         discrepancy['practitioner'],
         discrepancy['reconciliation_date']
@@ -842,11 +975,22 @@ def render_discrepancy_detail(discrepancy):
     if not transactions.empty:
         display_cols = ['site', 'session_slot', 'appointments', 'revenue', 'card', 'cash']
         display_cols = [c for c in display_cols if c in transactions.columns]
-        st.dataframe(transactions[display_cols], use_container_width=True, height=150)
-    else:
-        st.info("No transaction data found in revenue_data.")
+        st.dataframe(
+            transactions[display_cols].rename(columns={
+                'site': 'Site',
+                'session_slot': 'Session',
+                'appointments': 'Appts',
+                'revenue': 'Revenue £',
+                'card': 'Card £',
+                'cash': 'Cash £'
+            }),
+            use_container_width=True,
+            height=100,
+            hide_index=True
+        )
     
     # Resolution form
+    st.markdown("---")
     st.markdown("#### ✅ Resolve This Discrepancy")
     
     col1, col2 = st.columns([3, 1])
@@ -906,9 +1050,6 @@ def render_discrepancy_detail(discrepancy):
         else:
             st.error("Please enter your name")
 
-# =============================================================================
-# PAGE: PENDING DISCREPANCIES
-# =============================================================================
 
 def render_pending_discrepancies():
     """Render pending discrepancies page"""
@@ -924,8 +1065,42 @@ def render_pending_discrepancies():
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        months = ['All'] + sorted(df['year_month'].dropna().unique().tolist(), reverse=True)
-        selected_month = st.selectbox("📅 Month", months, key="pend_month")
+        # Get unique dates from the dataframe
+        unique_dates = pd.to_datetime(df['reconciliation_date']).dt.date.unique()
+        
+        # Add "All Dates" option
+        show_all = st.checkbox("📅 All Dates", value=True, key="show_all_dates")
+        
+        if not show_all:
+            # Date Range Picker
+            st.markdown("**Select Date Range:**")
+            col_d1, col_d2 = st.columns(2)
+            
+            with col_d1:
+                start_date = st.date_input(
+                    "Start Date",
+                    value=min(unique_dates) if len(unique_dates) > 0 else datetime.now().date() - timedelta(days=7),
+                    min_value=min(unique_dates) if len(unique_dates) > 0 else None,
+                    max_value=max(unique_dates) if len(unique_dates) > 0 else None,
+                    key="pend_start_date"
+                )
+            
+            with col_d2:
+                end_date = st.date_input(
+                    "End Date",
+                    value=max(unique_dates) if len(unique_dates) > 0 else datetime.now().date(),
+                    min_value=min(unique_dates) if len(unique_dates) > 0 else None,
+                    max_value=max(unique_dates) if len(unique_dates) > 0 else None,
+                    key="pend_end_date"
+                )
+            
+            # Validate date range
+            if start_date > end_date:
+                st.error("⚠️ Start Date must be before End Date")
+                return
+        else:
+            start_date = None
+            end_date = None
     
     with col2:
         practitioners = ['All'] + sorted(df['practitioner'].dropna().unique().tolist())
@@ -949,8 +1124,13 @@ def render_pending_discrepancies():
     # Apply filters
     filtered_df = df.copy()
     
-    if selected_month != 'All':
-        filtered_df = filtered_df[filtered_df['year_month'] == selected_month]
+    # Date range filter
+    if start_date is not None and end_date is not None:
+        filtered_df = filtered_df[
+            (pd.to_datetime(filtered_df['reconciliation_date']).dt.date >= start_date) &
+            (pd.to_datetime(filtered_df['reconciliation_date']).dt.date <= end_date)
+        ]
+    
     if selected_practitioner != 'All':
         filtered_df = filtered_df[filtered_df['practitioner'] == selected_practitioner]
     if selected_site != 'All':
@@ -978,8 +1158,7 @@ def render_pending_discrepancies():
         reception = len(filtered_df[filtered_df['is_reception'] == True])
         st.metric("🏢 Reception", reception)
     
-    # Discrepancy list with expandable details
-    # Discrepancy list - TABLE VIEW (faster)
+    # Discrepancy list - TABLE VIEW
     st.markdown("---")
     st.subheader("📋 Discrepancies")
     
@@ -1006,14 +1185,14 @@ def render_pending_discrepancies():
             selected_row = filtered_df[filtered_df['id'] == selected_id].iloc[0]
             render_discrepancy_detail(selected_row)
     
-    with col3:
-        csv = filtered_df.to_csv(index=False)
-        st.download_button(
-            "📥 Export to CSV",
-            data=csv,
-            file_name=f"pending_discrepancies_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
+    # Export
+    csv = filtered_df.to_csv(index=False)
+    st.download_button(
+        "📥 Export to CSV",
+        data=csv,
+        file_name=f"pending_discrepancies_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
 
 # =============================================================================
 # PAGE: RESOLVED DISCREPANCIES
