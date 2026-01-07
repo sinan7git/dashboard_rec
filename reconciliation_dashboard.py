@@ -494,57 +494,59 @@ def load_revenue_by_practitioner():
 @st.cache_data(ttl=300)
 def load_invoice_revenue_by_practitioner():
     """
-    Load revenue from invoices grouped by practitioner using strict total_amount logic.
-    Logic: If duplicate invoice_id_ref exists, prioritize the row where is_deposit=False
-    to capture the single source of truth for total_amount.
+    Load revenue from invoices grouped by practitioner.
+    FIX: Resolve practitioner from non-deposit row first.
     """
     query = """
-    WITH RankedInvoices AS (
-        SELECT 
-            *,
-            -- LOGIC: Partition by invoice ID. 
-            -- Order by is_deposit ASC (False comes first).
-            -- If an invoice has a Deposit row and a Normal row, the Normal row becomes rn=1.
-            -- If it only has one row, that row becomes rn=1.
-            ROW_NUMBER() OVER (
-                PARTITION BY invoice_id_ref 
-                ORDER BY is_deposit ASC, id DESC
-            ) as rn
+    WITH PractitionerLookup AS (
+        -- Get practitioner name from non-deposit rows
+        SELECT DISTINCT ON (invoice_id_ref)
+            invoice_id_ref,
+            practitioner as resolved_practitioner
         FROM clearearwax_finance_invoice_data
-        WHERE invoice_date >= CURRENT_DATE - INTERVAL '6 months' -- Adjust timeframe as needed
+        WHERE invoice_date >= CURRENT_DATE - INTERVAL '6 months'
+          AND invoice_id_ref IS NOT NULL
+          AND practitioner IS NOT NULL 
+          AND practitioner != ''
+        ORDER BY invoice_id_ref, is_deposit ASC, id DESC
+    ),
+    RankedInvoices AS (
+        SELECT 
+            f.id,
+            f.invoice_id_ref,
+            f.invoice_date,
+            f.total_amount,
+            f.payment_taken,
+            f.payment_method,
+            f.source,
+            f.is_deposit,
+            -- Use resolved practitioner, fallback to original
+            COALESCE(pl.resolved_practitioner, f.practitioner, 'Unknown') as final_practitioner,
+            ROW_NUMBER() OVER (
+                PARTITION BY f.invoice_id_ref 
+                ORDER BY f.is_deposit ASC, f.id DESC
+            ) as rn
+        FROM clearearwax_finance_invoice_data f
+        LEFT JOIN PractitionerLookup pl ON f.invoice_id_ref = pl.invoice_id_ref
+        WHERE f.invoice_date >= CURRENT_DATE - INTERVAL '6 months'
     )
     SELECT 
-        practitioner,
+        final_practitioner as practitioner,
         TO_CHAR(invoice_date, 'YYYY-MM') as year_month,
         TO_CHAR(invoice_date, 'Mon YYYY') as month_display,
         
-        -- Count unique invoices (only count row 1s)
         COUNT(CASE WHEN rn = 1 THEN 1 END) as total_invoices,
-        
-        -- REVENUE CALCULATION:
-        -- Only take total_amount from the #1 ranked row (Non-deposit preferred)
-        SUM(CASE 
-            WHEN rn = 1 THEN total_amount 
-            ELSE 0 
-        END) as total_revenue,
-        
-        -- Breakdown Metrics (Optional: keeps payment_taken for accurate cash/card split)
+        SUM(CASE WHEN rn = 1 THEN total_amount ELSE 0 END) as total_revenue,
         SUM(CASE WHEN payment_method = 'card' THEN payment_taken ELSE 0 END) as card_payments,
-        SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END) as cash_payments,
-        
-        -- Deposit Tracking
-        SUM(CASE WHEN is_deposit = true THEN payment_taken ELSE 0 END) as deposit_amount,
-        
-        -- Source Counts (Unique Invoices)
-        COUNT(CASE WHEN rn = 1 AND source = 'Clear Earwax' THEN 1 END) as clearearwax_count,
-        COUNT(CASE WHEN rn = 1 AND source = 'Hearing Expert' THEN 1 END) as hearingexpert_count
+        SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END) as cash_payments
         
     FROM RankedInvoices
-    GROUP BY practitioner, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
+    WHERE final_practitioner IS NOT NULL 
+      AND final_practitioner != ''
+    GROUP BY final_practitioner, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
     ORDER BY year_month DESC, total_revenue DESC
     """
     return fetch_dataframe(query)
-
 
 @st.cache_data(ttl=300)
 def load_invoice_revenue_by_site():
@@ -989,9 +991,9 @@ def render_invoice_revenue_practitioner_dashboard():
         'total_revenue': 'sum',
         'card_payments': 'sum', # Note: This is still payment_taken sum
         'cash_payments': 'sum', # Note: This is still payment_taken sum
-        'deposit_amount': 'sum',
-        'clearearwax_count': 'sum',
-        'hearingexpert_count': 'sum'
+        # 'deposit_amount': 'sum',
+        # 'clearearwax_count': 'sum',
+        # 'hearingexpert_count': 'sum'
     }).reset_index()
     
     # Sort by Revenue
@@ -1004,9 +1006,9 @@ def render_invoice_revenue_practitioner_dashboard():
             'total_revenue': 'Total Amount (£)',
             'card_payments': 'Card Paid (£)',
             'cash_payments': 'Cash Paid (£)',
-            'deposit_amount': 'Deposits (£)',
-            'clearearwax_count': 'CEW Count',
-            'hearingexpert_count': 'HE Count'
+            # 'deposit_amount': 'Deposits (£)',
+            # 'clearearwax_count': 'CEW Count',
+            # 'hearingexpert_count': 'HE Count'
         }),
         use_container_width=True,
         hide_index=True
@@ -1048,18 +1050,18 @@ def render_invoice_revenue_site_dashboard():
     
     # Metrics
     st.markdown("---")
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2 = st.columns(2)
     
     with col1:
         st.metric("💰 Revenue", f"£{filtered_df['total_revenue'].sum():,.2f}")
     with col2:
         st.metric("🏥 Sites", f"{filtered_df['site'].nunique()}")
-    with col3:
-        st.metric("📄 Invoices", f"{filtered_df['total_invoices'].sum():,}")
-    with col4:
-        st.metric("💳 Card", f"£{filtered_df['card_payments'].sum():,.2f}")
-    with col5:
-        st.metric("👥 Practitioners", f"{filtered_df['practitioner_count'].sum()}")
+    # with col3:
+    #     st.metric("📄 Invoices", f"{filtered_df['total_invoices'].sum():,}")
+    # with col4:
+    #     st.metric("💳 Card", f"£{filtered_df['card_payments'].sum():,.2f}")
+    # with col5:
+    #     st.metric("👥 Practitioners", f"{filtered_df['practitioner_count'].sum()}")
     
     # Charts
     st.markdown("---")
@@ -1092,8 +1094,8 @@ def render_invoice_revenue_site_dashboard():
         'total_revenue': 'sum',
         'card_payments': 'sum',
         'cash_payments': 'sum',
-        'other_payments': 'sum',
-        'deposit_amount': 'sum',
+        # 'other_payments': 'sum',
+        # 'deposit_amount': 'sum',
         'practitioner_count': 'sum'
     }).reset_index()
     
@@ -1106,8 +1108,8 @@ def render_invoice_revenue_site_dashboard():
             'total_revenue': 'Revenue',
             'card_payments': 'Card',
             'cash_payments': 'Cash',
-            'other_payments': 'Other',
-            'deposit_amount': 'Deposits',
+            # 'other_payments': 'Other',
+            # 'deposit_amount': 'Deposits',
             'avg_per_invoice': 'Avg/Invoice',
             'practitioner_count': 'Practitioners'
         }).sort_values('Revenue', ascending=False),
