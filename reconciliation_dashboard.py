@@ -931,6 +931,15 @@ def render_invoice_revenue_practitioner_dashboard():
     total_rev = filtered_df['total_revenue'].sum()
     total_inv = filtered_df['total_invoices'].sum()
     
+    m1,  m3,  = st.columns(2)
+    
+    with m1:
+        st.metric("💰 Total Invoiced Revenue", f"£{total_rev:,.2f}", help="Sum of Total Amount (deduplicated)")
+
+    with m3:
+        avg = total_rev / max(total_inv, 1)
+        st.metric("📊 Avg Invoice Value", f"£{avg:.2f}")
+
     m1, m2, m3, m4 = st.columns(4)
     
     with m1:
