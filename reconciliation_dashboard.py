@@ -150,6 +150,7 @@ def load_invoices_for_discrepancy(practitioner, date, site):
         'practitioner': practitioner.split()[0].lower() if practitioner else ''
     })
 
+
 def load_transactions_for_practitioner(practitioner, date):
     """Load transaction data for practitioner on date"""
     query = """
@@ -176,6 +177,7 @@ def load_transactions_for_practitioner(practitioner, date):
         'date': date, 
         'practitioner': practitioner.split()[0].lower() if practitioner else ''
     })
+
 
 def load_bank_transactions_for_discrepancy(terminal, date):
     """Load raw bank transactions for a specific terminal and date"""
@@ -1396,14 +1398,14 @@ def render_discrepancy_detail(discrepancy):
             # Show metrics
             st.metric("Expected Total (Card)", f"£{invoice_total:.2f}", f"{invoice_count} Invoices")
             
-            # Show table - USE created_at instead of invoice_date
-            display_cols = ['invoice_date', 'site', 'contact_name', 'service_provided', 'payment_taken', 'invoice_number','total_amount']
+            # Show table
+            display_cols = ['invoice_date', 'site', 'contact_name', 'service_provided', 'payment_taken', 'invoice_number', 'total_amount']
             display_cols = [c for c in display_cols if c in card_invoices.columns]
             
-            # Format time from created_at
             display_df = card_invoices[display_cols].copy()
-            if 'created_at' in display_df.columns:
-                display_df['created_at'] = pd.to_datetime(display_df['created_at']).dt.strftime('%H:%M')
+            
+            # Add row number starting from 1
+            display_df.insert(0, '#', range(1, len(display_df) + 1))
             
             st.dataframe(
                 display_df.rename(columns={
@@ -1423,6 +1425,7 @@ def render_discrepancy_detail(discrepancy):
             st.warning("⚠️ No invoices found")
             st.caption("This might be due to clinician name mismatch (CRM ID vs Name)")
             st.metric("Expected Total (Card)", "£0.00")
+
     # RIGHT SIDE: Raw Bank Transactions (What ACTUALLY happened)
     with col_right:
         st.markdown("#### 🏦 Bank Transaction Log ")
