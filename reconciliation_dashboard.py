@@ -493,6 +493,7 @@ def load_revenue_by_practitioner():
     """
     return fetch_dataframe(query)
 
+
 @st.cache_data(ttl=300)
 def load_invoice_revenue_by_practitioner():
     """
@@ -500,102 +501,119 @@ def load_invoice_revenue_by_practitioner():
     FIX: Resolve practitioner from non-deposit row first.
     """
     query = """
-    WITH PractitionerLookup AS (
-        -- Get practitioner name from non-deposit rows
-        SELECT DISTINCT ON (invoice_id_ref)
-            invoice_id_ref,
-            practitioner as resolved_practitioner
-        FROM clearearwax_finance_invoice_data
-        WHERE invoice_date >= CURRENT_DATE - INTERVAL '6 months'
-          AND invoice_id_ref IS NOT NULL
-          AND practitioner IS NOT NULL 
-          AND practitioner != ''
-        ORDER BY invoice_id_ref, is_deposit ASC, id DESC
-    ),
-    RankedInvoices AS (
-        SELECT 
-            f.id,
-            f.invoice_id_ref,
-            f.invoice_date,
-            f.total_amount,
-            f.payment_taken,
-            f.payment_method,
-            f.source,
-            f.is_deposit,
-            -- Use resolved practitioner, fallback to original
-            COALESCE(pl.resolved_practitioner, f.practitioner, 'Unknown') as final_practitioner,
-            ROW_NUMBER() OVER (
-                PARTITION BY f.invoice_id_ref 
+            WITH PractitionerLookup AS (SELECT DISTINCT \
+            ON (invoice_id_ref)
+                invoice_id_ref,
+                practitioner as resolved_practitioner
+            FROM clearearwax_finance_invoice_data
+            WHERE invoice_date >= CURRENT_DATE - INTERVAL '6 months'
+              AND invoice_id_ref IS NOT NULL
+              AND practitioner IS NOT NULL
+              AND practitioner != ''
+            ORDER BY invoice_id_ref, is_deposit ASC, id DESC
+                ),
+                InvoiceStatus AS (
+            SELECT
+                invoice_id_ref, MAX (CASE WHEN is_deposit = false THEN 1 ELSE 0 END) as has_balance
+            FROM clearearwax_finance_invoice_data
+            WHERE invoice_date >= CURRENT_DATE - INTERVAL '6 months'
+              AND invoice_id_ref IS NOT NULL
+            GROUP BY invoice_id_ref
+                ),
+                RankedInvoices AS (
+            SELECT
+                f.id, f.invoice_id_ref, f.invoice_date, f.total_amount, f.payment_taken, f.payment_method, f.source, f.is_deposit, f.service_provided, COALESCE (pl.resolved_practitioner, f.practitioner, 'Unknown') as final_practitioner, COALESCE (s.has_balance, 0) as has_balance, ROW_NUMBER() OVER (
+                PARTITION BY f.invoice_id_ref
                 ORDER BY f.is_deposit ASC, f.id DESC
-            ) as rn
-        FROM clearearwax_finance_invoice_data f
-        LEFT JOIN PractitionerLookup pl ON f.invoice_id_ref = pl.invoice_id_ref
-        WHERE f.invoice_date >= CURRENT_DATE - INTERVAL '6 months'
-    )
-    SELECT 
-        final_practitioner as practitioner,
-        TO_CHAR(invoice_date, 'YYYY-MM') as year_month,
-        TO_CHAR(invoice_date, 'Mon YYYY') as month_display,
-        
-        COUNT(CASE WHEN rn = 1 THEN 1 END) as total_invoices,
-        SUM(CASE WHEN rn = 1 THEN total_amount ELSE 0 END) as total_revenue,
-        SUM(CASE WHEN payment_method = 'card' THEN payment_taken ELSE 0 END) as card_payments,
-        SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END) as cash_payments
-        
-    FROM RankedInvoices
-    WHERE final_practitioner IS NOT NULL 
-      AND final_practitioner != ''
-    GROUP BY final_practitioner, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
-    ORDER BY year_month DESC, total_revenue DESC
-    """
+                ) as rn
+            FROM clearearwax_finance_invoice_data f
+                LEFT JOIN PractitionerLookup pl \
+            ON f.invoice_id_ref = pl.invoice_id_ref
+                LEFT JOIN InvoiceStatus s ON f.invoice_id_ref = s.invoice_id_ref
+            WHERE f.invoice_date >= CURRENT_DATE - INTERVAL '6 months'
+                )
+            SELECT final_practitioner                                                   as practitioner, \
+                   TO_CHAR(invoice_date, 'YYYY-MM')                                     as year_month, \
+                   TO_CHAR(invoice_date, 'Mon YYYY')                                    as month_display, \
+
+                   COUNT(CASE WHEN rn = 1 THEN 1 END)                                   as total_invoices, \
+
+                   SUM(CASE \
+                           WHEN rn = 1 AND is_deposit = true AND has_balance = 0 \
+                               AND LOWER(service_provided) NOT LIKE '%%no show%%' \
+                               THEN payment_taken \
+                           WHEN rn = 1 \
+                               THEN total_amount \
+                           ELSE 0 \
+                       END)                                                             as total_revenue, \
+
+                   COUNT(CASE \
+                             WHEN rn = 1 AND is_deposit = true AND has_balance = 0 \
+                                 AND LOWER(service_provided) NOT LIKE '%%no show%%' \
+                                 THEN 1 \
+                       END)                                                             as deposit_only_count, \
+
+                   SUM(CASE WHEN payment_method = 'card' THEN payment_taken ELSE 0 END) as card_payments, \
+                   SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END) as cash_payments
+
+            FROM RankedInvoices
+            WHERE final_practitioner IS NOT NULL
+              AND final_practitioner != ''
+            GROUP BY final_practitioner, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
+            ORDER BY year_month DESC, total_revenue DESC \
+            """
     return fetch_dataframe(query)
+
 
 @st.cache_data(ttl=300)
 def load_invoice_revenue_by_site():
     """Load revenue from invoices grouped by clinic/site"""
     query = """
-    SELECT 
-        clinic as site,
-        TO_CHAR(invoice_date, 'YYYY-MM') as year_month,
-        TO_CHAR(invoice_date, 'Mon YYYY') as month_display,
-        
-        -- Count unique invoices
-        COUNT(DISTINCT invoice_id_ref) as total_invoices,
-        
-        -- Total revenue (avoid duplicates)
-        SUM(CASE 
-            WHEN rn = 1 THEN total_amount 
-            ELSE 0 
-        END) as total_revenue,
-        
-        -- Payments by method
-        SUM(CASE WHEN payment_method = 'card' THEN payment_taken ELSE 0 END) as card_payments,
-        SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END) as cash_payments,
-        SUM(CASE WHEN payment_method = 'other' THEN payment_taken ELSE 0 END) as other_payments,
-        
-        -- Deposit tracking
-        SUM(CASE WHEN is_deposit THEN payment_taken ELSE 0 END) as deposit_amount,
-        COUNT(DISTINCT CASE WHEN is_deposit THEN invoice_id_ref END) as deposit_count,
-        
-        -- Average
-        CASE 
-            WHEN COUNT(DISTINCT invoice_id_ref) > 0 
-            THEN ROUND((SUM(CASE WHEN rn = 1 THEN total_amount ELSE 0 END)::numeric / COUNT(DISTINCT invoice_id_ref)), 2)
-            ELSE 0
-        END as avg_per_invoice,
-        
-        -- Practitioners working at this site
-        COUNT(DISTINCT practitioner) as practitioner_count
-        
-    FROM (
-        SELECT *,
-            ROW_NUMBER() OVER (PARTITION BY invoice_id_ref ORDER BY id) as rn
-        FROM clearearwax_finance_invoice_data
-        WHERE invoice_date >= CURRENT_DATE - INTERVAL '90 days'
-    ) ranked
-    GROUP BY clinic, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
-    ORDER BY year_month DESC, total_revenue DESC
-    """
+            WITH InvoiceStatus AS (SELECT invoice_id_ref, \
+                                          MAX(CASE WHEN is_deposit = false THEN 1 ELSE 0 END) as has_balance \
+                                   FROM clearearwax_finance_invoice_data \
+                                   WHERE invoice_date >= CURRENT_DATE - INTERVAL '90 days'
+                AND invoice_id_ref IS NOT NULL
+            GROUP BY invoice_id_ref
+                )
+            SELECT clinic                                                                as site, \
+                   TO_CHAR(invoice_date, 'YYYY-MM')                                      as year_month, \
+                   TO_CHAR(invoice_date, 'Mon YYYY')                                     as month_display, \
+
+                   COUNT(DISTINCT ranked.invoice_id_ref)                                 as total_invoices, \
+
+                   SUM(CASE \
+                           WHEN rn = 1 AND is_deposit = true AND COALESCE(s.has_balance, 0) = 0 \
+                               AND LOWER(service_provided) NOT LIKE '%%no show%%' \
+                               THEN payment_taken \
+                           WHEN rn = 1 \
+                               THEN total_amount \
+                           ELSE 0 \
+                       END)                                                              as total_revenue, \
+
+                   COUNT(DISTINCT CASE \
+                                      WHEN is_deposit = true AND COALESCE(s.has_balance, 0) = 0 \
+                                          AND LOWER(service_provided) NOT LIKE '%%no show%%' \
+                                          THEN ranked.invoice_id_ref \
+                       END)                                                              as deposit_only_invoices, \
+
+                   SUM(CASE WHEN payment_method = 'card' THEN payment_taken ELSE 0 END)  as card_payments, \
+                   SUM(CASE WHEN payment_method = 'cash' THEN payment_taken ELSE 0 END)  as cash_payments, \
+                   SUM(CASE WHEN payment_method = 'other' THEN payment_taken ELSE 0 END) as other_payments, \
+
+                   SUM(CASE WHEN is_deposit THEN payment_taken ELSE 0 END)               as deposit_amount, \
+                   COUNT(DISTINCT CASE WHEN is_deposit THEN ranked.invoice_id_ref END)   as deposit_count, \
+
+                   COUNT(DISTINCT practitioner)                                          as practitioner_count
+
+            FROM (SELECT *, \
+                         ROW_NUMBER() OVER (PARTITION BY invoice_id_ref ORDER BY is_deposit ASC, id DESC) as rn \
+                  FROM clearearwax_finance_invoice_data \
+                  WHERE invoice_date >= CURRENT_DATE - INTERVAL '90 days') ranked
+                     LEFT JOIN InvoiceStatus s ON ranked.invoice_id_ref = s.invoice_id_ref
+            GROUP BY clinic, TO_CHAR(invoice_date, 'YYYY-MM'), TO_CHAR(invoice_date, 'Mon YYYY')
+            ORDER BY year_month DESC, total_revenue DESC \
+            """
     return fetch_dataframe(query)
 
 @st.cache_data(ttl=300)
