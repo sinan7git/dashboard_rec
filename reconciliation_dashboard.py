@@ -139,6 +139,7 @@ def load_invoices_for_discrepancy(practitioner, date, site):
     FROM clearearwax_finance_invoice_data
     WHERE invoice_date::date = :date
       AND payment_method = 'card'
+      AND clinic = :site 
       AND (
         LOWER(SPLIT_PART(practitioner, ' ', 1)) = LOWER(:practitioner)
         OR LOWER(practitioner) = LOWER(:practitioner)
@@ -147,7 +148,8 @@ def load_invoices_for_discrepancy(practitioner, date, site):
     """
     return fetch_dataframe(query, {
         'date': date, 
-        'practitioner': practitioner.split()[0].lower() if practitioner else ''
+        'practitioner': practitioner.split()[0].lower() if practitioner else '',
+        'site': site
     })
 
 
