@@ -181,8 +181,10 @@ def load_transactions_for_practitioner(practitioner, date):
     })
 
 
-def load_bank_transactions_for_discrepancy(terminal, date):
-    """Load raw bank transactions for a specific terminal and date"""
+def load_bank_transactions_for_discrepancy(terminal, date, session_slot=None):
+    """Load raw bank transactions for a specific terminal, date, and optionally session"""
+
+    # Base query
     query = """
     SELECT 
         TO_CHAR(trans_local_time, 'HH24:MI:SS') as time,
@@ -194,9 +196,38 @@ def load_bank_transactions_for_discrepancy(terminal, date):
     FROM merchant_transactions
     WHERE terminal_sn = :terminal
       AND trans_local_time::date = :date
-    ORDER BY trans_local_time ASC
     """
-    return fetch_dataframe(query, {'terminal': str(terminal), 'date': date})
+
+    params = {'terminal': str(terminal), 'date': date}
+
+    # Add session time filter if provided (with 15-minute buffer)
+    if session_slot and session_slot.lower() not in ['n/a', 'null', 'none', '']:
+        try:
+            # Parse session slot like "04:00pm - 06:30pm"
+            start_time, end_time = session_slot.split(' - ')
+
+            # Convert to 24-hour format
+            from datetime import datetime, timedelta
+            start_dt = datetime.strptime(start_time.strip(), '%I:%M%p')
+            end_dt = datetime.strptime(end_time.strip(), '%I:%M%p')
+
+            # Add 15-minute buffer on both sides
+            start_with_buffer = (start_dt - timedelta(minutes=15)).strftime('%H:%M:%S')
+            end_with_buffer = (end_dt + timedelta(minutes=15)).strftime('%H:%M:%S')
+
+            query += """
+              AND TO_CHAR(trans_local_time, 'HH24:MI:SS') >= :start_time
+              AND TO_CHAR(trans_local_time, 'HH24:MI:SS') <= :end_time
+            """
+            params['start_time'] = start_with_buffer
+            params['end_time'] = end_with_buffer
+        except:
+            # If parsing fails, ignore session filter
+            pass
+
+    query += " ORDER BY trans_local_time ASC"
+
+    return fetch_dataframe(query, params)
 
 
 @st.cache_data(ttl=60)
@@ -1453,7 +1484,8 @@ def render_discrepancy_detail(discrepancy):
         
         bank_transactions = load_bank_transactions_for_discrepancy(
             discrepancy['terminal'],
-            discrepancy['reconciliation_date']
+            discrepancy['reconciliation_date'],
+            discrepancy['session_slot']
         )
         
         if not bank_transactions.empty:
