@@ -139,7 +139,6 @@ def load_invoices_for_discrepancy(practitioner, date, site):
     FROM clearearwax_finance_invoice_data
     WHERE invoice_date::date = :date
       AND payment_method = 'card'
-      AND clinic = :site 
       AND (
         LOWER(SPLIT_PART(practitioner, ' ', 1)) = LOWER(:practitioner)
         OR LOWER(practitioner) = LOWER(:practitioner)
@@ -149,7 +148,7 @@ def load_invoices_for_discrepancy(practitioner, date, site):
     return fetch_dataframe(query, {
         'date': date, 
         'practitioner': practitioner.split()[0].lower() if practitioner else '',
-        'site': site
+        # 'site': site
     })
 
 
@@ -182,9 +181,13 @@ def load_transactions_for_practitioner(practitioner, date):
 
 
 def load_bank_transactions_for_discrepancy(terminal, date, session_slot=None):
-    """Load raw bank transactions for a specific terminal, date, and optionally session"""
+    """Load raw bank transactions for a specific terminal and date
 
-    # Base query
+    Since discrepancies are aggregated per DAY, we load ALL transactions.
+    Session filtering is only applied if a specific time range is provided
+    (not "Full Day").
+    """
+
     query = """
     SELECT 
         TO_CHAR(trans_local_time, 'HH24:MI:SS') as time,
@@ -200,18 +203,17 @@ def load_bank_transactions_for_discrepancy(terminal, date, session_slot=None):
 
     params = {'terminal': str(terminal), 'date': date}
 
-    # Add session time filter if provided (with 15-minute buffer)
-    if session_slot and session_slot.lower() not in ['n/a', 'null', 'none', '']:
+    # Only filter by session if it's a specific time range (not "Full Day")
+    if session_slot and session_slot.lower() not in ['n/a', 'null', 'none', '', 'full day']:
         try:
             # Parse session slot like "04:00pm - 06:30pm"
             start_time, end_time = session_slot.split(' - ')
 
-            # Convert to 24-hour format
             from datetime import datetime, timedelta
             start_dt = datetime.strptime(start_time.strip(), '%I:%M%p')
             end_dt = datetime.strptime(end_time.strip(), '%I:%M%p')
 
-            # Add 15-minute buffer on both sides
+            # Add 15-minute buffer
             start_with_buffer = (start_dt - timedelta(minutes=15)).strftime('%H:%M:%S')
             end_with_buffer = (end_dt + timedelta(minutes=15)).strftime('%H:%M:%S')
 
@@ -222,8 +224,7 @@ def load_bank_transactions_for_discrepancy(terminal, date, session_slot=None):
             params['start_time'] = start_with_buffer
             params['end_time'] = end_with_buffer
         except:
-            # If parsing fails, ignore session filter
-            pass
+            pass  # If parsing fails, load full day
 
     query += " ORDER BY trans_local_time ASC"
 
@@ -1409,7 +1410,10 @@ def render_discrepancy_detail(discrepancy):
     
     with col2:
         st.markdown(f"**Site:** {discrepancy['site']}")
-        st.markdown(f"**Session:** {discrepancy['session_slot'] or 'N/A'}")
+        session_display = discrepancy['session_slot'] or 'N/A'
+        if session_display.lower() == 'full day':
+            session_display = '📅 Full Day (Aggregated)'
+        st.markdown(f"**Session:** {session_display}")
     
     with col3:
         st.markdown(f"**Terminal:** {discrepancy['terminal']}")
@@ -1600,8 +1604,9 @@ def render_discrepancy_detail(discrepancy):
                    discrepancy['site'].lower() in ['unknown', 'null', 'none', '', 'no schedule'])
 
 # Check if session is invalid (N/A means no schedule)
-    session_is_invalid = (not discrepancy['session_slot'] or 
-                        discrepancy['session_slot'].lower() in ['n/a', 'null', 'none', ''])
+    session_is_invalid = (not discrepancy['session_slot'] or
+                          discrepancy['session_slot'].lower() in ['n/a', 'null', 'none', ''] and
+                          discrepancy['session_slot'].lower() != 'full day')
 
     if site_is_invalid or session_is_invalid:
         if site_is_invalid:
